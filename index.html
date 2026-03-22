@@ -1,0 +1,1093 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Futures Trade Journal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0d1520; font-family: 'JetBrains Mono', monospace; -webkit-font-smoothing: antialiased; }
+  .flex { display: flex; }
+  .flex-col { flex-direction: column; }
+  .gap-1 { gap: 4px; }
+  #root { min-height: 100vh; }
+  select, input, textarea { -webkit-appearance: none; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script type="text/babel">
+const { useState, useEffect, useCallback, useMemo } = React;
+
+
+
+const SETUP_TYPES = ["PMZ", "Supply/Demand Zone", "Liquidity Sweep", "Fibonacci", "EMA Cloud Bounce", "Momentum Scalp"];
+const EMOTIONS = ["Disciplined", "Confident", "Cautious", "FOMO", "Revenge", "Frustrated", "Tilted", "Overconfident", "Anxious"];
+const SESSIONS = ["NY Pre-Market", "NY Open (9:30-10:30)", "NY Morning (10:30-12:00)", "NY Afternoon (12:00-4:00)", "London", "Asian", "Overnight"];
+const FIRMS = ["Topstep", "Lucid Trading"];
+const ACCT_TYPES = ["Eval", "Funded"];
+const INSTRUMENTS = ["MNQ", "MES", "M2K", "MYM"];
+const DIRECTIONS = ["Long", "Short"];
+const RULES = ["Yes", "No - Deviated", "Partial"];
+
+// Tick values per instrument for P&L calculation
+// MNQ: $0.50 per tick (0.25 point), so $2 per point
+// MES: $1.25 per tick (0.25 point), so $5 per point
+// M2K: $0.50 per tick (0.10 point), so $5 per point
+// MYM: $0.50 per tick (1.00 point), so $0.50 per point
+const POINT_VALUES = { MNQ: 2, MES: 5, M2K: 5, MYM: 0.5 };
+
+const calcPnl = (instrument, direction, entry, exit, contracts) => {
+  const e = parseFloat(entry);
+  const x = parseFloat(exit);
+  const c = parseInt(contracts);
+  const pv = POINT_VALUES[instrument];
+  if (!pv || isNaN(e) || isNaN(x) || isNaN(c) || c === 0) return "";
+  const diff = direction === "Long" ? (x - e) : (e - x);
+  return (diff * pv * c).toFixed(2);
+};
+
+const STORAGE_KEY = "futures-journal-trades";
+const WEEKLY_KEY = "futures-journal-weekly";
+
+const defaultTrade = {
+  id: "", date: "", session: "", firm: "", accountType: "", accountId: "",
+  instrument: "", setupType: "", direction: "", contracts: "",
+  entryPrice: "", exitPrice: "", pnl: "", followedRules: "",
+  emotion: "", notes: "", screenshotLink: "", setupGroup: ""
+};
+
+const defaultWeekly = { weekStart: "", sessions: "", pnl: "", topSetup: "", lesson: "", goal: "" };
+
+// Utility functions
+const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+const today = () => new Date().toISOString().split("T")[0];
+const pct = (n, d) => d === 0 ? "—" : (n / d * 100).toFixed(1) + "%";
+const currency = (v) => {
+  if (v === 0) return "$0.00";
+  const neg = v < 0;
+  return (neg ? "-" : "") + "$" + Math.abs(v).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+};
+
+function FuturesJournal() {
+  const [view, setView] = useState("log");
+  const [trades, setTrades] = useState([]);
+  const [weeklyReviews, setWeeklyReviews] = useState([]);
+  const [form, setForm] = useState({ ...defaultTrade, id: genId(), date: today() });
+  const [weeklyForm, setWeeklyForm] = useState({ ...defaultWeekly });
+  const [editingId, setEditingId] = useState(null);
+  const [csvText, setCsvText] = useState("");
+  const [csvStatus, setCsvStatus] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [saveStatus, setSaveStatus] = useState("");
+  const [showForm, setShowForm] = useState(false);
+  const [filterSetup, setFilterSetup] = useState("All");
+  const [filterEmotion, setFilterEmotion] = useState("All");
+  const [filterAcct, setFilterAcct] = useState("All");
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const [batchMode, setBatchMode] = useState(false);
+  const [batchFields, setBatchFields] = useState({ setupType: "", emotion: "", accountType: "", followedRules: "" });
+
+  const toggleSelect = (id) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const selectAll = () => {
+    if (selectedIds.size === filteredTrades.length) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(filteredTrades.map(t => t.id)));
+    }
+  };
+
+  const applyBatch = () => {
+    if (selectedIds.size === 0) return;
+    setTrades(prev => prev.map(t => {
+      if (!selectedIds.has(t.id)) return t;
+      const updated = { ...t };
+      if (batchFields.setupType) updated.setupType = batchFields.setupType;
+      if (batchFields.emotion) updated.emotion = batchFields.emotion;
+      if (batchFields.accountType) updated.accountType = batchFields.accountType;
+      if (batchFields.followedRules) updated.followedRules = batchFields.followedRules;
+      return updated;
+    }));
+    setSelectedIds(new Set());
+    setBatchFields({ setupType: "", emotion: "", accountType: "", followedRules: "" });
+    setBatchMode(false);
+  };
+
+  const cancelBatch = () => {
+    setSelectedIds(new Set());
+    setBatchFields({ setupType: "", emotion: "", accountType: "", followedRules: "" });
+    setBatchMode(false);
+  };
+
+  // Load data from localStorage
+  useEffect(() => {
+    try {
+      const t = localStorage.getItem(STORAGE_KEY);
+      if (t) { const parsed = JSON.parse(t); if (Array.isArray(parsed)) setTrades(parsed); }
+    } catch(e) { console.log("Trade load error:", e); }
+    try {
+      const w = localStorage.getItem(WEEKLY_KEY);
+      if (w) { const parsed = JSON.parse(w); if (Array.isArray(parsed)) setWeeklyReviews(parsed); }
+    } catch(e) { console.log("Weekly load error:", e); }
+    setSaveStatus("storage_ok");
+    setLoaded(true);
+  }, []);
+
+  // Save data to localStorage
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(trades));
+      setSaveStatus("saved");
+      setTimeout(() => setSaveStatus("storage_ok"), 2000);
+    } catch(e) { console.error("Trade save failed:", e); setSaveStatus("error"); }
+  }, [trades, loaded]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(WEEKLY_KEY, JSON.stringify(weeklyReviews));
+    } catch(e) { console.error("Weekly save failed:", e); }
+  }, [weeklyReviews, loaded]);
+
+  const [autoCalcEnabled, setAutoCalcEnabled] = useState(true);
+
+  // Auto-calculate P&L whenever relevant form fields change
+  useEffect(() => {
+    if (!autoCalcEnabled) return;
+    const { instrument, direction, entryPrice, exitPrice, contracts } = form;
+    if (instrument && direction && entryPrice && exitPrice && contracts) {
+      const result = calcPnl(instrument, direction, entryPrice, exitPrice, contracts);
+      if (result !== "") {
+        setForm(p => {
+          if (p.pnl === result) return p;
+          return { ...p, pnl: result };
+        });
+      }
+    }
+  }, [form.instrument, form.direction, form.entryPrice, form.exitPrice, form.contracts, autoCalcEnabled]);
+
+  // Trade CRUD
+  const saveTrade = () => {
+    if (!form.date) return;
+    if (editingId) {
+      setTrades(prev => prev.map(t => t.id === editingId ? { ...form } : t));
+      setEditingId(null);
+    } else {
+      setTrades(prev => [{ ...form }, ...prev]);
+    }
+    setForm({ ...defaultTrade, id: genId(), date: today() });
+    setShowForm(false);
+  };
+
+  const editTrade = (t) => {
+    setForm({ ...t });
+    setEditingId(t.id);
+    setShowForm(true);
+    setView("log");
+  };
+
+  const deleteTrade = (id) => {
+    setTrades(prev => prev.filter(t => t.id !== id));
+  };
+
+  // CSV Import — FIFO position tracker handles pyramids, partial closes, re-entries
+  const parseAndImport = (rawText) => {
+    if (!rawText.trim()) return;
+    const lines = rawText.trim().split("\n");
+
+    // Step 1: Parse all filled orders into structured data
+    const fills = [];
+    for (const line of lines) {
+      let cols = line.split("\t").map(s => s.trim().replace(/^"|"$/g, ""));
+      if (cols.length < 5) cols = line.split(",").map(s => s.trim().replace(/^"|"$/g, ""));
+      if (cols.length < 10) continue;
+
+      const first = cols[0]?.toLowerCase() || "";
+      if (first.includes("order") || first.includes("id") || first.includes("time") || first.includes("date")) continue;
+
+      const status = cols[3] || "";
+      if (!status.toLowerCase().includes("filled")) continue;
+
+      const accountId = cols[1] || "";
+      const symbol = cols[2] || "";
+      const qty = parseInt(cols[5]) || 0;
+      const side = cols[6] || "";
+      const fillTimeStr = cols[9] || cols[7] || "";
+      const fillPrice = parseFloat(cols[13] || cols[12] || "0");
+      const orderType = cols[15] || "";
+
+      let fillTime = 0;
+      try {
+        const cleanTime = fillTimeStr.replace(/\s*[-+]\d{2}:\d{2}$/, "");
+        fillTime = new Date(cleanTime).getTime();
+      } catch {}
+
+      let dateStr = today();
+      try {
+        const match = fillTimeStr.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+        if (match) dateStr = `${match[3]}-${match[1]}-${match[2]}`;
+      } catch {}
+
+      const instrument = INSTRUMENTS.find(i => symbol.toUpperCase().includes(i)) || symbol;
+      const isBuy = side.toLowerCase().includes("bid") || side.toLowerCase().includes("buy");
+
+      // Extract hour:minute in Central time for session detection
+      let fillHour = -1;
+      let fillMinute = 0;
+      try {
+        const timeMatch = fillTimeStr.match(/(\d{2})\/\d{2}\/\d{4}\s+(\d{1,2}):(\d{2})/);
+        if (timeMatch) {
+          fillHour = parseInt(timeMatch[2]);
+          fillMinute = parseInt(timeMatch[3]);
+        }
+      } catch {}
+
+      fills.push({ accountId, symbol, instrument, qty, isBuy, fillTime, fillPrice, dateStr, orderType, fillHour, fillMinute });
+    }
+
+    // Sort by fill time
+    fills.sort((a, b) => a.fillTime - b.fillTime);
+
+    // Session detection based on Central time
+    // Futures sessions in CT:
+    // Asian:           5:00 PM - 1:59 AM (17:00-01:59)
+    // London:          2:00 AM - 7:59 AM (02:00-07:59)
+    // NY Pre-Market:   8:00 AM - 8:29 AM (08:00-08:29)
+    // NY Open:         8:30 AM - 9:30 AM (08:30-09:30) — maps to "NY Open (9:30-10:30)" ET
+    // NY Morning:      9:31 AM - 11:00 AM (09:31-11:00)
+    // NY Afternoon:    11:01 AM - 3:00 PM (11:01-15:00)
+    // Overnight:       3:01 PM - 4:59 PM (15:01-16:59)
+    const detectSession = (hour, minute) => {
+      if (hour < 0) return "";
+      const t = hour * 60 + minute;
+      if (t >= 1020 || t < 120) return "Asian"; // 5PM-1:59AM
+      if (t >= 120 && t < 480) return "London"; // 2AM-7:59AM
+      if (t >= 480 && t < 510) return "NY Pre-Market"; // 8AM-8:29AM
+      if (t >= 510 && t < 571) return "NY Open (9:30-10:30)"; // 8:30AM-9:30AM CT = 9:30-10:30 ET
+      if (t >= 571 && t < 660) return "NY Morning (10:30-12:00)"; // 9:31AM-11AM CT
+      if (t >= 660 && t < 900) return "NY Afternoon (12:00-4:00)"; // 11AM-3PM CT
+      return "Overnight"; // 3PM-5PM CT
+    };
+
+    // Step 2: FIFO position tracking
+    let openLots = [];
+    let position = 0;
+    let setupPnl = 0;
+    let setupContracts = 0;
+    let setupEntries = [];
+    let setupCloses = [];
+    let setupNum = 0;
+    let setupStartDate = "";
+    let setupStartHour = -1;
+    let setupStartMinute = 0;
+    let setupInstrument = "";
+    let setupAccountId = "";
+    let setupDirection = "";
+    const setups = [];
+
+    const flushSetup = () => {
+      if (setupContracts === 0 && setupPnl === 0) return;
+      setupNum++;
+      const avgEntry = setupEntries.length > 0
+        ? setupEntries.reduce((s, e) => s + e.price * e.qty, 0) / setupEntries.reduce((s, e) => s + e.qty, 0)
+        : 0;
+      const avgExit = setupCloses.length > 0
+        ? setupCloses.reduce((s, e) => s + e.price * e.qty, 0) / setupCloses.reduce((s, e) => s + e.qty, 0)
+        : 0;
+
+      setups.push({
+        id: genId(),
+        date: setupStartDate,
+        session: detectSession(setupStartHour, setupStartMinute),
+        firm: "Topstep",
+        accountType: "",
+        accountId: setupAccountId,
+        instrument: setupInstrument,
+        setupType: "",
+        direction: setupDirection,
+        contracts: String(setupContracts),
+        entryPrice: avgEntry.toFixed(2),
+        exitPrice: avgExit.toFixed(2),
+        pnl: setupPnl.toFixed(2),
+        followedRules: "",
+        emotion: "",
+        notes: `${setupEntries.length} entr${setupEntries.length === 1 ? "y" : "ies"}, ${setupCloses.length} exit${setupCloses.length === 1 ? "" : "s"} | Avg in: ${avgEntry.toFixed(2)} → Avg out: ${avgExit.toFixed(2)}`,
+        screenshotLink: "",
+        setupGroup: `Setup ${setupNum}`
+      });
+
+      // Reset
+      setupPnl = 0;
+      setupContracts = 0;
+      setupEntries = [];
+      setupCloses = [];
+      setupStartDate = "";
+      setupStartHour = -1;
+      setupStartMinute = 0;
+      setupInstrument = "";
+      setupAccountId = "";
+      setupDirection = "";
+    };
+
+    for (const fill of fills) {
+      const signedQty = fill.isBuy ? fill.qty : -fill.qty;
+      const prevPosition = position;
+      const newPosition = position + signedQty;
+
+      const pv = POINT_VALUES[fill.instrument] || 2;
+
+      // Determine if this fill is increasing or reducing position
+      const isIncreasing = (prevPosition >= 0 && signedQty > 0) || (prevPosition <= 0 && signedQty < 0);
+      const isReducing = !isIncreasing && prevPosition !== 0;
+
+      if (prevPosition === 0) {
+        // Starting a new position from flat — new setup
+        if (setupContracts > 0) flushSetup();
+        setupStartDate = fill.dateStr;
+        setupStartHour = fill.fillHour;
+        setupStartMinute = fill.fillMinute;
+        setupInstrument = fill.instrument;
+        setupAccountId = fill.accountId;
+        setupDirection = fill.isBuy ? "Long" : "Short";
+        openLots.push({ qty: fill.qty, price: fill.fillPrice });
+        setupEntries.push({ qty: fill.qty, price: fill.fillPrice });
+        setupContracts += fill.qty;
+      } else if (isIncreasing) {
+        // Adding to position (pyramid)
+        openLots.push({ qty: fill.qty, price: fill.fillPrice });
+        setupEntries.push({ qty: fill.qty, price: fill.fillPrice });
+        setupContracts += fill.qty;
+      } else if (isReducing) {
+        // Reducing position — FIFO match against open lots and calc P&L
+        let remainingQty = fill.qty;
+        setupCloses.push({ qty: fill.qty, price: fill.fillPrice });
+
+        while (remainingQty > 0 && openLots.length > 0) {
+          const lot = openLots[0];
+          const matchQty = Math.min(lot.qty, remainingQty);
+
+          // P&L for this matched portion
+          if (position > 0) {
+            // Was long, this sell is reducing
+            setupPnl += (fill.fillPrice - lot.price) * pv * matchQty;
+          } else {
+            // Was short, this buy is reducing
+            setupPnl += (lot.price - fill.fillPrice) * pv * matchQty;
+          }
+
+          lot.qty -= matchQty;
+          remainingQty -= matchQty;
+
+          if (lot.qty === 0) openLots.shift();
+        }
+
+        // If fill flipped the position (e.g., was +3, sold 5, now -2)
+        if (Math.sign(newPosition) !== 0 && Math.sign(newPosition) !== Math.sign(prevPosition)) {
+          // Flush current setup
+          flushSetup();
+          // Start new setup in opposite direction
+          const flipQty = Math.abs(newPosition);
+          setupStartDate = fill.dateStr;
+          setupStartHour = fill.fillHour;
+          setupStartMinute = fill.fillMinute;
+          setupInstrument = fill.instrument;
+          setupAccountId = fill.accountId;
+          setupDirection = newPosition > 0 ? "Long" : "Short";
+          openLots = [{ qty: flipQty, price: fill.fillPrice }];
+          setupEntries = [{ qty: flipQty, price: fill.fillPrice }];
+          setupContracts = flipQty;
+        }
+      }
+
+      position = newPosition;
+
+      // If position is flat, flush the setup
+      if (position === 0 && setupContracts > 0) {
+        flushSetup();
+        openLots = [];
+      }
+    }
+
+    // Flush any remaining open setup (position not flat at end of data)
+    if (setupContracts > 0) {
+      flushSetup();
+    }
+
+    if (setups.length > 0) {
+      setTrades(prev => [...setups, ...prev]);
+      const totalPnl = setups.reduce((s, t) => s + parseFloat(t.pnl), 0);
+      const wins = setups.filter(t => parseFloat(t.pnl) > 0).length;
+      const losses = setups.filter(t => parseFloat(t.pnl) < 0).length;
+      setCsvStatus(`Imported ${setups.length} setups (${wins}W / ${losses}L) | Session P&L: ${currency(totalPnl)}`);
+      setCsvText("");
+    } else {
+      setCsvStatus("No matched trades found. Make sure your export includes both Opening and Closing fills.");
+    }
+  };
+
+  const importCSV = () => parseAndImport(csvText);
+
+  // File upload handler
+  const handleFileUpload = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      const text = evt.target.result;
+      parseAndImport(text);
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  // Save weekly review
+  const saveWeekly = () => {
+    if (!weeklyForm.weekStart) return;
+    setWeeklyReviews(prev => [{ ...weeklyForm, id: genId() }, ...prev]);
+    setWeeklyForm({ ...defaultWeekly });
+  };
+
+  // Analytics
+  const analytics = useMemo(() => {
+    if (trades.length === 0) return null;
+    const withPnl = trades.filter(t => t.pnl !== "" && !isNaN(parseFloat(t.pnl)));
+    const pnls = withPnl.map(t => parseFloat(t.pnl));
+    const wins = pnls.filter(p => p > 0);
+    const losses = pnls.filter(p => p < 0);
+    const totalPnl = pnls.reduce((s, v) => s + v, 0);
+    const sumWins = wins.reduce((s, v) => s + v, 0);
+    const sumLosses = losses.reduce((s, v) => s + v, 0);
+
+    const bySetup = {};
+    SETUP_TYPES.forEach(st => {
+      const t = withPnl.filter(tr => tr.setupType === st);
+      const p = t.map(tr => parseFloat(tr.pnl));
+      const w = p.filter(v => v > 0);
+      const l = p.filter(v => v < 0);
+      bySetup[st] = {
+        count: t.length, wins: w.length, losses: l.length,
+        totalPnl: p.reduce((s, v) => s + v, 0),
+        avgPnl: p.length ? p.reduce((s, v) => s + v, 0) / p.length : 0,
+        avgWin: w.length ? w.reduce((s, v) => s + v, 0) / w.length : 0,
+        avgLoss: l.length ? l.reduce((s, v) => s + v, 0) / l.length : 0,
+        profitFactor: Math.abs(l.reduce((s, v) => s + v, 0)) > 0 ? w.reduce((s, v) => s + v, 0) / Math.abs(l.reduce((s, v) => s + v, 0)) : w.length > 0 ? Infinity : 0,
+        best: p.length ? Math.max(...p) : 0,
+        worst: p.length ? Math.min(...p) : 0
+      };
+    });
+
+    const byEmotion = {};
+    EMOTIONS.forEach(em => {
+      const t = withPnl.filter(tr => tr.emotion === em);
+      const p = t.map(tr => parseFloat(tr.pnl));
+      const w = p.filter(v => v > 0);
+      byEmotion[em] = {
+        count: t.length,
+        winRate: p.length ? w.length / p.length : 0,
+        totalPnl: p.reduce((s, v) => s + v, 0),
+        avgPnl: p.length ? p.reduce((s, v) => s + v, 0) / p.length : 0
+      };
+    });
+
+    const bySession = {};
+    SESSIONS.forEach(s => {
+      const t = withPnl.filter(tr => tr.session === s);
+      const p = t.map(tr => parseFloat(tr.pnl));
+      const w = p.filter(v => v > 0);
+      bySession[s] = {
+        count: t.length,
+        winRate: p.length ? w.length / p.length : 0,
+        totalPnl: p.reduce((s2, v) => s2 + v, 0),
+        avgPnl: p.length ? p.reduce((s2, v) => s2 + v, 0) / p.length : 0
+      };
+    });
+
+    const byAcct = {};
+    ACCT_TYPES.forEach(a => {
+      const t = withPnl.filter(tr => tr.accountType === a);
+      const p = t.map(tr => parseFloat(tr.pnl));
+      const w = p.filter(v => v > 0);
+      const l = p.filter(v => v < 0);
+      byAcct[a] = {
+        count: t.length,
+        winRate: p.length ? w.length / p.length : 0,
+        totalPnl: p.reduce((s, v) => s + v, 0),
+        avgPnl: p.length ? p.reduce((s, v) => s + v, 0) / p.length : 0,
+        profitFactor: Math.abs(l.reduce((s, v) => s + v, 0)) > 0 ? w.reduce((s, v) => s + v, 0) / Math.abs(l.reduce((s, v) => s + v, 0)) : w.length > 0 ? Infinity : 0
+      };
+    });
+
+    const byRules = {};
+    RULES.forEach(r => {
+      const t = withPnl.filter(tr => tr.followedRules === r);
+      const p = t.map(tr => parseFloat(tr.pnl));
+      const w = p.filter(v => v > 0);
+      byRules[r] = {
+        count: t.length,
+        winRate: p.length ? w.length / p.length : 0,
+        totalPnl: p.reduce((s, v) => s + v, 0),
+        avgPnl: p.length ? p.reduce((s, v) => s + v, 0) / p.length : 0
+      };
+    });
+
+    return {
+      total: trades.length, withPnlCount: withPnl.length,
+      winRate: pnls.length ? wins.length / pnls.length : 0,
+      totalPnl, avgWin: wins.length ? sumWins / wins.length : 0,
+      avgLoss: losses.length ? sumLosses / losses.length : 0,
+      profitFactor: Math.abs(sumLosses) > 0 ? sumWins / Math.abs(sumLosses) : wins.length > 0 ? Infinity : 0,
+      bySetup, byEmotion, bySession, byAcct, byRules
+    };
+  }, [trades]);
+
+  // Filtered trades for log view
+  const filteredTrades = useMemo(() => {
+    return trades.filter(t => {
+      if (filterSetup !== "All" && t.setupType !== filterSetup) return false;
+      if (filterEmotion !== "All" && t.emotion !== filterEmotion) return false;
+      if (filterAcct !== "All" && t.accountType !== filterAcct) return false;
+      return true;
+    });
+  }, [trades, filterSetup, filterEmotion, filterAcct]);
+
+  const Select = ({ value, onChange, options, placeholder, label }) => (
+    <div className="flex flex-col gap-1">
+      {label && <label style={{ fontSize: 11, color: "#8a9bb5", fontFamily: "'JetBrains Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>{label}</label>}
+      <select value={value} onChange={e => onChange(e.target.value)} style={{
+        background: "#1a2332", border: "1px solid #2a3a4e", borderRadius: 6, padding: "8px 10px",
+        color: "#e0e8f0", fontSize: 13, fontFamily: "'JetBrains Mono', monospace", width: "100%", outline: "none"
+      }}>
+        <option value="">{placeholder || "Select..."}</option>
+        {options.map(o => <option key={o} value={o}>{o}</option>)}
+      </select>
+    </div>
+  );
+
+  const Input = ({ value, onChange, placeholder, label, type = "text" }) => (
+    <div className="flex flex-col gap-1">
+      {label && <label style={{ fontSize: 11, color: "#8a9bb5", fontFamily: "'JetBrains Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>{label}</label>}
+      <input type={type} value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder} style={{
+        background: "#1a2332", border: "1px solid #2a3a4e", borderRadius: 6, padding: "8px 10px",
+        color: "#e0e8f0", fontSize: 13, fontFamily: "'JetBrains Mono', monospace", width: "100%", outline: "none", boxSizing: "border-box"
+      }} />
+    </div>
+  );
+
+  const KpiCard = ({ label, value, color }) => (
+    <div style={{
+      background: "linear-gradient(135deg, #1a2332 0%, #0f1923 100%)",
+      border: "1px solid #2a3a4e", borderRadius: 10, padding: "14px 16px",
+      flex: "1 1 140px", minWidth: 130
+    }}>
+      <div style={{ fontSize: 11, color: "#8a9bb5", fontFamily: "'JetBrains Mono', monospace", textTransform: "uppercase", letterSpacing: 1, marginBottom: 4 }}>{label}</div>
+      <div style={{ fontSize: 22, fontWeight: 700, color: color || "#e0e8f0", fontFamily: "'JetBrains Mono', monospace" }}>{value}</div>
+    </div>
+  );
+
+  const SectionHeader = ({ children }) => (
+    <div style={{
+      background: "linear-gradient(90deg, #1b998b 0%, #0f7b6d 100%)",
+      borderRadius: 8, padding: "10px 16px", marginBottom: 12, marginTop: 24
+    }}>
+      <span style={{ fontSize: 14, fontWeight: 700, color: "#fff", fontFamily: "'JetBrains Mono', monospace", textTransform: "uppercase", letterSpacing: 1.5 }}>{children}</span>
+    </div>
+  );
+
+  const TableRow = ({ cells, header = false, highlight = false }) => (
+    <div style={{
+      display: "flex", gap: 0, borderBottom: "1px solid #1a2332",
+      background: header ? "#1a2332" : highlight ? "#141e2b" : "transparent",
+      padding: "8px 0", alignItems: "center"
+    }}>
+      {cells.map((c, i) => (
+        <div key={i} style={{
+          flex: i === 0 ? "2 1 0" : "1 1 0", fontSize: header ? 11 : 13,
+          color: header ? "#8a9bb5" : typeof c === "string" && c.startsWith("-$") ? "#e74c3c" : typeof c === "string" && c.startsWith("$") ? "#2ecc71" : "#e0e8f0",
+          fontFamily: "'JetBrains Mono', monospace", textAlign: i === 0 ? "left" : "center",
+          fontWeight: header ? 600 : 400, textTransform: header ? "uppercase" : "none",
+          letterSpacing: header ? 0.8 : 0, padding: "0 6px", overflow: "hidden",
+          textOverflow: "ellipsis", whiteSpace: "nowrap"
+        }}>{c}</div>
+      ))}
+    </div>
+  );
+
+  if (!loaded) return (
+    <div style={{ background: "#0d1520", minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div style={{ color: "#1b998b", fontFamily: "'JetBrains Mono', monospace", fontSize: 16 }}>Loading journal...</div>
+    </div>
+  );
+
+  const navItems = [
+    { key: "log", label: "Trade Log", icon: "◉" },
+    { key: "dashboard", label: "Dashboard", icon: "◫" },
+    { key: "import", label: "CSV Import", icon: "⇧" },
+    { key: "weekly", label: "Weekly Review", icon: "☰" }
+  ];
+
+  return (
+    <div style={{ background: "#0d1520", minHeight: "100vh", color: "#e0e8f0", fontFamily: "'JetBrains Mono', monospace" }}>
+      {/* Header */}
+      <div style={{
+        background: "linear-gradient(135deg, #0d1520 0%, #1a2332 50%, #0d1520 100%)",
+        borderBottom: "1px solid #1b998b33", padding: "16px 20px",
+        display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: 0, zIndex: 50
+      }}>
+        <div>
+          <div style={{ fontSize: 18, fontWeight: 800, color: "#1b998b", letterSpacing: 2 }}>FUTURES JOURNAL</div>
+          <div style={{ fontSize: 10, color: "#5a6b80", letterSpacing: 1.5, marginTop: 2 }}>TRUST THE DATA</div>
+        </div>
+        <div style={{ fontSize: 12, color: "#5a6b80", textAlign: "right" }}>
+          <div>{trades.length} trades logged</div>
+          {saveStatus === "saved" && <div style={{ fontSize: 9, color: "#1b998b", marginTop: 2 }}>✓ Saved</div>}
+          {saveStatus === "error" && <div style={{ fontSize: 9, color: "#e74c3c", marginTop: 2 }}>⚠ Save failed</div>}
+          {saveStatus === "no_storage" && <div style={{ fontSize: 9, color: "#e74c3c", marginTop: 2 }}>⚠ Storage unavailable</div>}
+          {saveStatus === "storage_ok" && <div style={{ fontSize: 9, color: "#1b998b", marginTop: 2 }}>✓ Storage connected</div>}
+        </div>
+      </div>
+
+      {/* Nav */}
+      <div style={{
+        display: "flex", gap: 0, borderBottom: "1px solid #2a3a4e",
+        background: "#111c28", overflowX: "auto"
+      }}>
+        {navItems.map(n => (
+          <button key={n.key} onClick={() => setView(n.key)} style={{
+            flex: 1, padding: "12px 8px", background: view === n.key ? "#1a2332" : "transparent",
+            border: "none", borderBottom: view === n.key ? "2px solid #1b998b" : "2px solid transparent",
+            color: view === n.key ? "#1b998b" : "#5a6b80", cursor: "pointer",
+            fontFamily: "'JetBrains Mono', monospace", fontSize: 11, fontWeight: 600,
+            letterSpacing: 0.5, whiteSpace: "nowrap", transition: "all 0.2s"
+          }}>
+            <span style={{ fontSize: 16, display: "block", marginBottom: 2 }}>{n.icon}</span>
+            {n.label}
+          </button>
+        ))}
+      </div>
+
+      <div style={{ padding: "16px", maxWidth: 900, margin: "0 auto" }}>
+
+        {/* ===== TRADE LOG ===== */}
+        {view === "log" && (
+          <div>
+            {!showForm && (
+              <button onClick={() => { setForm({ ...defaultTrade, id: genId(), date: today() }); setEditingId(null); setShowForm(true); setAutoCalcEnabled(true); }} style={{
+                width: "100%", padding: "14px", background: "linear-gradient(135deg, #1b998b, #0f7b6d)",
+                border: "none", borderRadius: 10, color: "#fff", fontWeight: 700, fontSize: 14,
+                fontFamily: "'JetBrains Mono', monospace", cursor: "pointer", letterSpacing: 1, marginBottom: 16
+              }}>+ LOG NEW TRADE</button>
+            )}
+
+            {showForm && (
+              <div style={{ background: "#111c28", borderRadius: 12, border: "1px solid #2a3a4e", padding: 20, marginBottom: 20 }}>
+                <div style={{ fontSize: 14, fontWeight: 700, color: "#1b998b", marginBottom: 16, letterSpacing: 1 }}>
+                  {editingId ? "EDIT TRADE" : "NEW TRADE"}
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                  <Input label="Date" type="date" value={form.date} onChange={v => setForm(p => ({ ...p, date: v }))} />
+                  <Select label="Session" value={form.session} onChange={v => setForm(p => ({ ...p, session: v }))} options={SESSIONS} />
+                  <Select label="Firm" value={form.firm} onChange={v => setForm(p => ({ ...p, firm: v }))} options={FIRMS} />
+                  <Select label="Account Type" value={form.accountType} onChange={v => setForm(p => ({ ...p, accountType: v }))} options={ACCT_TYPES} />
+                  <Input label="Account ID" value={form.accountId} onChange={v => setForm(p => ({ ...p, accountId: v }))} placeholder="e.g. XFA-1234" />
+                  <Select label="Instrument" value={form.instrument} onChange={v => setForm(p => ({ ...p, instrument: v }))} options={INSTRUMENTS} />
+                  <Select label="Setup Type" value={form.setupType} onChange={v => setForm(p => ({ ...p, setupType: v }))} options={SETUP_TYPES} />
+                  <Select label="Direction" value={form.direction} onChange={v => setForm(p => ({ ...p, direction: v }))} options={DIRECTIONS} />
+                  <Input label="# Contracts" type="number" value={form.contracts} onChange={v => setForm(p => ({ ...p, contracts: v }))} />
+                  <Input label="Entry Price" value={form.entryPrice} onChange={v => setForm(p => ({ ...p, entryPrice: v }))} placeholder="20000.00" />
+                  <Input label="Exit Price" value={form.exitPrice} onChange={v => setForm(p => ({ ...p, exitPrice: v }))} placeholder="20010.00" />
+                  <div className="flex flex-col gap-1">
+                    <label style={{ fontSize: 11, color: "#8a9bb5", fontFamily: "'JetBrains Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>
+                      P&L ($) {form.entryPrice && form.exitPrice && form.contracts && form.instrument && form.direction ? 
+                        <span style={{ color: "#1b998b", fontSize: 9, marginLeft: 4 }}>AUTO-CALC</span> : 
+                        <span style={{ color: "#5a6b80", fontSize: 9, marginLeft: 4 }}>or enter manually</span>}
+                    </label>
+                    <input type="text" inputMode="decimal" value={form.pnl} onChange={e => { setAutoCalcEnabled(false); setForm(p => ({ ...p, pnl: e.target.value })); }} placeholder="-50.00" style={{
+                      background: "#1a2332", border: "1px solid #2a3a4e", borderRadius: 6, padding: "8px 10px",
+                      color: parseFloat(form.pnl) >= 0 ? "#2ecc71" : "#e74c3c", fontSize: 13, 
+                      fontFamily: "'JetBrains Mono', monospace", width: "100%", outline: "none", boxSizing: "border-box",
+                      fontWeight: 700
+                    }} />
+                  </div>
+                  <Select label="Followed Rules?" value={form.followedRules} onChange={v => setForm(p => ({ ...p, followedRules: v }))} options={RULES} />
+                  <Select label="Emotional State" value={form.emotion} onChange={v => setForm(p => ({ ...p, emotion: v }))} options={EMOTIONS} />
+                  <Input label="Setup Group" value={form.setupGroup} onChange={v => setForm(p => ({ ...p, setupGroup: v }))} placeholder="e.g. Setup 1" />
+                </div>
+                <div style={{ marginTop: 12 }}>
+                  <Input label="Notes" value={form.notes} onChange={v => setForm(p => ({ ...p, notes: v }))} placeholder="Quick notes on this trade..." />
+                </div>
+                <div style={{ marginTop: 12 }}>
+                  <Input label="Screenshot Link" value={form.screenshotLink} onChange={v => setForm(p => ({ ...p, screenshotLink: v }))} placeholder="URL to chart screenshot" />
+                </div>
+                <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+                  <button onClick={saveTrade} style={{
+                    flex: 1, padding: "12px", background: "#1b998b", border: "none", borderRadius: 8,
+                    color: "#fff", fontWeight: 700, fontSize: 13, fontFamily: "'JetBrains Mono', monospace", cursor: "pointer"
+                  }}>{editingId ? "UPDATE" : "SAVE TRADE"}</button>
+                  <button onClick={() => { setShowForm(false); setEditingId(null); setForm({ ...defaultTrade, id: genId(), date: today() }); setAutoCalcEnabled(true); }} style={{
+                    padding: "12px 20px", background: "transparent", border: "1px solid #2a3a4e", borderRadius: 8,
+                    color: "#8a9bb5", fontSize: 13, fontFamily: "'JetBrains Mono', monospace", cursor: "pointer"
+                  }}>CANCEL</button>
+                </div>
+              </div>
+            )}
+
+            {/* Filters */}
+            <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+              <select value={filterSetup} onChange={e => setFilterSetup(e.target.value)} style={{
+                background: "#1a2332", border: "1px solid #2a3a4e", borderRadius: 6, padding: "6px 8px",
+                color: "#8a9bb5", fontSize: 11, fontFamily: "'JetBrains Mono', monospace"
+              }}>
+                <option value="All">All Setups</option>
+                {SETUP_TYPES.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+              <select value={filterEmotion} onChange={e => setFilterEmotion(e.target.value)} style={{
+                background: "#1a2332", border: "1px solid #2a3a4e", borderRadius: 6, padding: "6px 8px",
+                color: "#8a9bb5", fontSize: 11, fontFamily: "'JetBrains Mono', monospace"
+              }}>
+                <option value="All">All Emotions</option>
+                {EMOTIONS.map(e => <option key={e} value={e}>{e}</option>)}
+              </select>
+              <select value={filterAcct} onChange={e => setFilterAcct(e.target.value)} style={{
+                background: "#1a2332", border: "1px solid #2a3a4e", borderRadius: 6, padding: "6px 8px",
+                color: "#8a9bb5", fontSize: 11, fontFamily: "'JetBrains Mono', monospace"
+              }}>
+                <option value="All">All Accounts</option>
+                {ACCT_TYPES.map(a => <option key={a} value={a}>{a}</option>)}
+              </select>
+            </div>
+
+            {/* Batch Edit Toggle & Panel */}
+            <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+              <button onClick={() => batchMode ? cancelBatch() : setBatchMode(true)} style={{
+                padding: "8px 14px", background: batchMode ? "#e74c3c33" : "#1a2332",
+                border: `1px solid ${batchMode ? "#e74c3c" : "#2a3a4e"}`, borderRadius: 6,
+                color: batchMode ? "#e74c3c" : "#8a9bb5", fontSize: 11, fontWeight: 600,
+                fontFamily: "'JetBrains Mono', monospace", cursor: "pointer"
+              }}>{batchMode ? "✕ CANCEL" : "☰ BATCH EDIT"}</button>
+              {batchMode && (
+                <button onClick={selectAll} style={{
+                  padding: "8px 14px", background: "#1a2332", border: "1px solid #2a3a4e", borderRadius: 6,
+                  color: "#8a9bb5", fontSize: 11, fontFamily: "'JetBrains Mono', monospace", cursor: "pointer"
+                }}>{selectedIds.size === filteredTrades.length ? "DESELECT ALL" : "SELECT ALL"}</button>
+              )}
+              {batchMode && selectedIds.size > 0 && (
+                <span style={{ fontSize: 11, color: "#1b998b", alignSelf: "center", fontFamily: "'JetBrains Mono', monospace" }}>
+                  {selectedIds.size} selected
+                </span>
+              )}
+            </div>
+
+            {batchMode && selectedIds.size > 0 && (
+              <div style={{
+                background: "#111c28", borderRadius: 10, border: "1px solid #1b998b44",
+                padding: 16, marginBottom: 16
+              }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: "#1b998b", marginBottom: 12, letterSpacing: 1 }}>
+                  APPLY TO {selectedIds.size} TRADE{selectedIds.size > 1 ? "S" : ""}
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                  <Select label="Setup Type" value={batchFields.setupType} onChange={v => setBatchFields(p => ({ ...p, setupType: v }))} options={SETUP_TYPES} placeholder="Don't change" />
+                  <Select label="Emotional State" value={batchFields.emotion} onChange={v => setBatchFields(p => ({ ...p, emotion: v }))} options={EMOTIONS} placeholder="Don't change" />
+                  <Select label="Account Type" value={batchFields.accountType} onChange={v => setBatchFields(p => ({ ...p, accountType: v }))} options={ACCT_TYPES} placeholder="Don't change" />
+                  <Select label="Followed Rules?" value={batchFields.followedRules} onChange={v => setBatchFields(p => ({ ...p, followedRules: v }))} options={RULES} placeholder="Don't change" />
+                </div>
+                <button onClick={applyBatch} style={{
+                  width: "100%", padding: 12, background: "linear-gradient(135deg, #1b998b, #0f7b6d)",
+                  border: "none", borderRadius: 8, color: "#fff", fontWeight: 700, fontSize: 13,
+                  fontFamily: "'JetBrains Mono', monospace", cursor: "pointer", marginTop: 12, letterSpacing: 1
+                }}>APPLY TO SELECTED</button>
+              </div>
+            )}
+
+            {/* Trade List */}
+            {filteredTrades.length === 0 ? (
+              <div style={{ textAlign: "center", padding: 40, color: "#5a6b80" }}>
+                <div style={{ fontSize: 36, marginBottom: 8 }}>◉</div>
+                <div style={{ fontSize: 13 }}>No trades logged yet. Start building your edge.</div>
+              </div>
+            ) : (
+              filteredTrades.map(t => {
+                const pnlVal = parseFloat(t.pnl) || 0;
+                const isWin = pnlVal > 0;
+                const isSelected = selectedIds.has(t.id);
+                return (
+                  <div key={t.id} onClick={batchMode ? () => toggleSelect(t.id) : undefined} style={{
+                    background: isSelected ? "#1b998b15" : "#111c28", borderRadius: 10,
+                    border: isSelected ? "1px solid #1b998b" : "1px solid #2a3a4e",
+                    padding: "14px 16px", marginBottom: 8,
+                    borderLeft: `3px solid ${isSelected ? "#1b998b" : isWin ? "#1b998b" : pnlVal < 0 ? "#e74c3c" : "#2a3a4e"}`,
+                    cursor: batchMode ? "pointer" : "default",
+                    transition: "all 0.15s"
+                  }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                        {batchMode && (
+                          <div style={{
+                            width: 20, height: 20, borderRadius: 4, border: `2px solid ${isSelected ? "#1b998b" : "#2a3a4e"}`,
+                            background: isSelected ? "#1b998b" : "transparent", display: "flex", alignItems: "center",
+                            justifyContent: "center", flexShrink: 0, transition: "all 0.15s"
+                          }}>
+                            {isSelected && <span style={{ color: "#fff", fontSize: 12, fontWeight: 700 }}>✓</span>}
+                          </div>
+                        )}
+                        <span style={{ fontSize: 12, color: "#8a9bb5" }}>{t.date}</span>
+                        {t.instrument && <span style={{ fontSize: 11, background: "#1a2332", padding: "2px 8px", borderRadius: 4, color: "#1b998b", fontWeight: 600 }}>{t.instrument}</span>}
+                        {t.setupType && <span style={{ fontSize: 11, background: "#1b998b22", padding: "2px 8px", borderRadius: 4, color: "#1b998b" }}>{t.setupType}</span>}
+                        {t.direction && <span style={{ fontSize: 11, color: t.direction === "Long" ? "#2ecc71" : "#e74c3c" }}>{t.direction}</span>}
+                        {t.setupGroup && <span style={{ fontSize: 10, color: "#5a6b80" }}>({t.setupGroup})</span>}
+                      </div>
+                      <div style={{
+                        fontSize: 16, fontWeight: 700,
+                        color: isWin ? "#2ecc71" : pnlVal < 0 ? "#e74c3c" : "#8a9bb5"
+                      }}>{t.pnl ? currency(pnlVal) : "—"}</div>
+                    </div>
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                      {t.firm && <span style={{ fontSize: 10, color: "#5a6b80" }}>{t.firm}</span>}
+                      {t.accountType && <span style={{ fontSize: 10, color: t.accountType === "Funded" ? "#f39c12" : "#5a6b80" }}>{t.accountType}</span>}
+                      {t.session && <span style={{ fontSize: 10, color: "#5a6b80" }}>{t.session}</span>}
+                      {t.emotion && <span style={{
+                        fontSize: 10, padding: "1px 6px", borderRadius: 3,
+                        background: ["FOMO", "Revenge", "Frustrated", "Tilted"].includes(t.emotion) ? "#e74c3c22" : "#1b998b22",
+                        color: ["FOMO", "Revenge", "Frustrated", "Tilted"].includes(t.emotion) ? "#e74c3c" : "#1b998b"
+                      }}>{t.emotion}</span>}
+                      {t.followedRules && <span style={{
+                        fontSize: 10, color: t.followedRules === "Yes" ? "#2ecc71" : t.followedRules === "Partial" ? "#f39c12" : "#e74c3c"
+                      }}>Rules: {t.followedRules}</span>}
+                      {!batchMode && (
+                        <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+                          <button onClick={() => editTrade(t)} style={{
+                            background: "transparent", border: "1px solid #2a3a4e", borderRadius: 4,
+                            color: "#8a9bb5", fontSize: 10, padding: "2px 8px", cursor: "pointer", fontFamily: "'JetBrains Mono', monospace"
+                          }}>Edit</button>
+                          <button onClick={() => deleteTrade(t.id)} style={{
+                            background: "transparent", border: "1px solid #e74c3c33", borderRadius: 4,
+                            color: "#e74c3c88", fontSize: 10, padding: "2px 8px", cursor: "pointer", fontFamily: "'JetBrains Mono', monospace"
+                          }}>Del</button>
+                        </div>
+                      )}
+                    </div>
+                    {t.notes && <div style={{ fontSize: 11, color: "#5a6b80", marginTop: 6, fontStyle: "italic" }}>{t.notes}</div>}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        )}
+
+        {/* ===== DASHBOARD ===== */}
+        {view === "dashboard" && (
+          <div>
+            {!analytics ? (
+              <div style={{ textAlign: "center", padding: 40, color: "#5a6b80" }}>
+                <div style={{ fontSize: 13 }}>Log trades to see your analytics.</div>
+              </div>
+            ) : (
+              <>
+                {/* KPIs */}
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 8 }}>
+                  <KpiCard label="Total Trades" value={analytics.total} />
+                  <KpiCard label="Win Rate" value={pct(analytics.winRate * analytics.withPnlCount, analytics.withPnlCount)} color={analytics.winRate >= 0.5 ? "#2ecc71" : "#e74c3c"} />
+                  <KpiCard label="Total P&L" value={currency(analytics.totalPnl)} color={analytics.totalPnl >= 0 ? "#2ecc71" : "#e74c3c"} />
+                </div>
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 8 }}>
+                  <KpiCard label="Avg Win" value={currency(analytics.avgWin)} color="#2ecc71" />
+                  <KpiCard label="Avg Loss" value={currency(analytics.avgLoss)} color="#e74c3c" />
+                  <KpiCard label="Profit Factor" value={analytics.profitFactor === Infinity ? "∞" : analytics.profitFactor.toFixed(2)} color={analytics.profitFactor >= 1.5 ? "#2ecc71" : analytics.profitFactor >= 1 ? "#f39c12" : "#e74c3c"} />
+                </div>
+
+                {/* Setup Type Performance */}
+                <SectionHeader>Setup Type Performance</SectionHeader>
+                <div style={{ overflowX: "auto" }}>
+                  <TableRow header cells={["Setup", "Trades", "Win%", "Total P&L", "Avg P&L", "PF"]} />
+                  {SETUP_TYPES.filter(s => analytics.bySetup[s].count > 0).sort((a, b) => analytics.bySetup[b].totalPnl - analytics.bySetup[a].totalPnl).map((s, i) => {
+                    const d = analytics.bySetup[s];
+                    return <TableRow key={s} highlight={i % 2 === 0} cells={[
+                      s, d.count, pct(d.wins, d.count), currency(d.totalPnl), currency(d.avgPnl),
+                      d.profitFactor === Infinity ? "∞" : d.profitFactor.toFixed(2)
+                    ]} />;
+                  })}
+                  {SETUP_TYPES.every(s => analytics.bySetup[s].count === 0) && (
+                    <div style={{ padding: 16, color: "#5a6b80", fontSize: 12, textAlign: "center" }}>Tag your trades with setup types to see performance data.</div>
+                  )}
+                </div>
+
+                {/* Emotional State */}
+                <SectionHeader>Emotional State Impact</SectionHeader>
+                <div style={{ overflowX: "auto" }}>
+                  <TableRow header cells={["Emotion", "Trades", "Win%", "Total P&L", "Avg P&L"]} />
+                  {EMOTIONS.filter(e => analytics.byEmotion[e].count > 0).sort((a, b) => analytics.byEmotion[b].totalPnl - analytics.byEmotion[a].totalPnl).map((e, i) => {
+                    const d = analytics.byEmotion[e];
+                    return <TableRow key={e} highlight={i % 2 === 0} cells={[
+                      e, d.count, pct(d.winRate * d.count, d.count), currency(d.totalPnl), currency(d.avgPnl)
+                    ]} />;
+                  })}
+                </div>
+
+                {/* Session */}
+                <SectionHeader>Session Performance</SectionHeader>
+                <div style={{ overflowX: "auto" }}>
+                  <TableRow header cells={["Session", "Trades", "Win%", "Total P&L", "Avg P&L"]} />
+                  {SESSIONS.filter(s => analytics.bySession[s].count > 0).sort((a, b) => analytics.bySession[b].totalPnl - analytics.bySession[a].totalPnl).map((s, i) => {
+                    const d = analytics.bySession[s];
+                    return <TableRow key={s} highlight={i % 2 === 0} cells={[
+                      s, d.count, pct(d.winRate * d.count, d.count), currency(d.totalPnl), currency(d.avgPnl)
+                    ]} />;
+                  })}
+                </div>
+
+                {/* Eval vs Funded */}
+                <SectionHeader>Eval vs Funded</SectionHeader>
+                <div style={{ overflowX: "auto" }}>
+                  <TableRow header cells={["Type", "Trades", "Win%", "Total P&L", "Avg P&L", "PF"]} />
+                  {ACCT_TYPES.filter(a => analytics.byAcct[a].count > 0).map((a, i) => {
+                    const d = analytics.byAcct[a];
+                    return <TableRow key={a} highlight={i % 2 === 0} cells={[
+                      a, d.count, pct(d.winRate * d.count, d.count), currency(d.totalPnl), currency(d.avgPnl),
+                      d.profitFactor === Infinity ? "∞" : d.profitFactor.toFixed(2)
+                    ]} />;
+                  })}
+                </div>
+
+                {/* Rule Adherence */}
+                <SectionHeader>Rule Adherence Impact</SectionHeader>
+                <div style={{ overflowX: "auto" }}>
+                  <TableRow header cells={["Followed Rules?", "Trades", "Win%", "Total P&L", "Avg P&L"]} />
+                  {RULES.filter(r => analytics.byRules[r].count > 0).map((r, i) => {
+                    const d = analytics.byRules[r];
+                    return <TableRow key={r} highlight={i % 2 === 0} cells={[
+                      r, d.count, pct(d.winRate * d.count, d.count), currency(d.totalPnl), currency(d.avgPnl)
+                    ]} />;
+                  })}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* ===== CSV IMPORT ===== */}
+        {view === "import" && (
+          <div>
+            <div style={{
+              background: "#111c28", borderRadius: 12, border: "1px solid #2a3a4e", padding: 20, marginBottom: 20
+            }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: "#1b998b", marginBottom: 12, letterSpacing: 1 }}>TOPSTEP CSV IMPORT</div>
+              <div style={{ fontSize: 12, color: "#8a9bb5", marginBottom: 16, lineHeight: 1.8 }}>
+                1. Open TopstepX → Trades tab → Export → Select date range → Export<br />
+                2. Upload the file below OR open the CSV, copy all rows, and paste<br />
+                3. Only "Filled" orders are imported — cancelled/rejected are skipped<br />
+                4. Fills within 2 minutes are auto-grouped into the same setup<br />
+                5. Go to Trade Log to add your tags (emotion, setup type, P&L, etc.)
+              </div>
+
+              {/* File Upload Button */}
+              <label style={{
+                display: "block", width: "100%", padding: 14, background: "linear-gradient(135deg, #9b59b6, #7d3c98)",
+                border: "none", borderRadius: 8, color: "#fff", fontWeight: 700, fontSize: 14,
+                fontFamily: "'JetBrains Mono', monospace", cursor: "pointer", letterSpacing: 1,
+                textAlign: "center", marginBottom: 12, boxSizing: "border-box"
+              }}>
+                ⇧ UPLOAD CSV FILE
+                <input type="file" accept=".csv,.txt,.tsv" onChange={handleFileUpload} style={{ display: "none" }} />
+              </label>
+
+              <div style={{ textAlign: "center", color: "#5a6b80", fontSize: 11, marginBottom: 12 }}>— or paste data below —</div>
+
+              <textarea value={csvText} onChange={e => setCsvText(e.target.value)} placeholder="Paste your Topstep export data here..." rows={10} style={{
+                width: "100%", background: "#1a2332", border: "1px solid #2a3a4e", borderRadius: 8,
+                padding: 12, color: "#e0e8f0", fontSize: 12, fontFamily: "'JetBrains Mono', monospace",
+                resize: "vertical", outline: "none", boxSizing: "border-box"
+              }} />
+              <button onClick={importCSV} style={{
+                width: "100%", padding: 14, background: "linear-gradient(135deg, #1b998b, #0f7b6d)",
+                border: "none", borderRadius: 8, color: "#fff", fontWeight: 700, fontSize: 14,
+                fontFamily: "'JetBrains Mono', monospace", cursor: "pointer", marginTop: 12, letterSpacing: 1
+              }}>IMPORT TRADES</button>
+              {csvStatus && (
+                <div style={{
+                  marginTop: 12, padding: 10, borderRadius: 6,
+                  background: csvStatus.includes("Imported") ? "#1b998b22" : "#e74c3c22",
+                  color: csvStatus.includes("Imported") ? "#1b998b" : "#e74c3c",
+                  fontSize: 12
+                }}>{csvStatus}</div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ===== WEEKLY REVIEW ===== */}
+        {view === "weekly" && (
+          <div>
+            <div style={{
+              background: "#111c28", borderRadius: 12, border: "1px solid #2a3a4e", padding: 20, marginBottom: 20
+            }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: "#f39c12", marginBottom: 16, letterSpacing: 1 }}>NEW WEEKLY REVIEW</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                <Input label="Week Starting" type="date" value={weeklyForm.weekStart} onChange={v => setWeeklyForm(p => ({ ...p, weekStart: v }))} />
+                <Input label="# Sessions" type="number" value={weeklyForm.sessions} onChange={v => setWeeklyForm(p => ({ ...p, sessions: v }))} />
+                <Input label="Total P&L" value={weeklyForm.pnl} onChange={v => setWeeklyForm(p => ({ ...p, pnl: v }))} placeholder="$500" />
+                <Select label="Top Setup This Week" value={weeklyForm.topSetup} onChange={v => setWeeklyForm(p => ({ ...p, topSetup: v }))} options={SETUP_TYPES} />
+              </div>
+              <div style={{ marginTop: 12 }}>
+                <Input label="Biggest Lesson" value={weeklyForm.lesson} onChange={v => setWeeklyForm(p => ({ ...p, lesson: v }))} placeholder="What did you learn?" />
+              </div>
+              <div style={{ marginTop: 12 }}>
+                <Input label="Goal for Next Week" value={weeklyForm.goal} onChange={v => setWeeklyForm(p => ({ ...p, goal: v }))} placeholder="What will you focus on?" />
+              </div>
+              <button onClick={saveWeekly} style={{
+                width: "100%", padding: 12, background: "linear-gradient(135deg, #f39c12, #d68910)",
+                border: "none", borderRadius: 8, color: "#fff", fontWeight: 700, fontSize: 13,
+                fontFamily: "'JetBrains Mono', monospace", cursor: "pointer", marginTop: 16, letterSpacing: 1
+              }}>SAVE WEEKLY REVIEW</button>
+            </div>
+
+            {weeklyReviews.length === 0 ? (
+              <div style={{ textAlign: "center", padding: 40, color: "#5a6b80", fontSize: 13 }}>
+                No weekly reviews yet. Start your first one above.
+              </div>
+            ) : (
+              weeklyReviews.map(w => (
+                <div key={w.id} style={{
+                  background: "#111c28", borderRadius: 10, border: "1px solid #2a3a4e",
+                  padding: 16, marginBottom: 8, borderLeft: "3px solid #f39c12"
+                }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: "#f39c12" }}>Week of {w.weekStart}</span>
+                    <span style={{ fontSize: 12, color: "#8a9bb5" }}>{w.sessions} sessions | {w.pnl}</span>
+                  </div>
+                  {w.topSetup && <div style={{ fontSize: 11, color: "#1b998b", marginBottom: 4 }}>Top Setup: {w.topSetup}</div>}
+                  {w.lesson && <div style={{ fontSize: 11, color: "#8a9bb5", marginBottom: 4 }}>Lesson: {w.lesson}</div>}
+                  {w.goal && <div style={{ fontSize: 11, color: "#8a9bb5" }}>Goal: {w.goal}</div>}
+                </div>
+              ))
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Footer spacer */}
+      <div style={{ height: 40 }} />
+    </div>
+  );
+}
+
+
+ReactDOM.createRoot(document.getElementById('root')).render(<FuturesJournal />);
+</script>
+</body>
+</html>
