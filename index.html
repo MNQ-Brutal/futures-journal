@@ -455,64 +455,175 @@ function FuturesJournal() {
     };
   },[trades]);
 
-  // CSV import (preserved from original + improved)
+  // ── CSV Import — supports both Topstep closed-trade format AND legacy order-fill format ──
   const parseAndImport = rawText => {
     if(!rawText.trim()) return;
-    const lines = rawText.trim().split("\n");
+
+    const lines = rawText.trim().split("\n").filter(l=>l.trim());
+    if(lines.length===0){ setCsvStatus("No data found."); return; }
+
+    // ── Helper: parse date string from Topstep format "MM/DD/YYYY HH:MM:SS -05:00"
+    const parseTopstepDate = str => {
+      if(!str) return { dateStr:today(), hour:-1, minute:0 };
+      // Extract date part MM/DD/YYYY
+      const dateMatch = str.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+      const dateStr = dateMatch ? `${dateMatch[3]}-${dateMatch[1]}-${dateMatch[2]}` : today();
+      // Extract time HH:MM (in the raw timezone — Topstep shows Central time offset)
+      const timeMatch = str.match(/\s(\d{1,2}):(\d{2}):\d{2}/);
+      const hour   = timeMatch ? parseInt(timeMatch[1]) : -1;
+      const minute = timeMatch ? parseInt(timeMatch[2]) : 0;
+      return { dateStr, hour, minute };
+    };
+
+    // ── Session detector (Central Time hours) ──
+    const detectSession = (h, m) => {
+      if(h < 0) return "";
+      const t = h*60 + m;
+      if(t>=1020 || t<120) return "Asian";
+      if(t>=120  && t<480) return "London";
+      if(t>=480  && t<510) return "NY Pre-Market";
+      if(t>=510  && t<571) return "NY Open (9:30-10:30)";
+      if(t>=571  && t<660) return "NY Morning (10:30-12:00)";
+      if(t>=660  && t<900) return "NY Afternoon (12:00-4:00)";
+      return "Overnight";
+    };
+
+    // ── Detect format by inspecting the header row ──
+    const headerRaw = lines[0];
+    const headerCols = headerRaw.split("\t").map(s=>s.trim().toLowerCase());
+    const isTabDelimited = headerCols.length >= 5;
+    const splitLine = line => isTabDelimited
+      ? line.split("\t").map(s=>s.trim().replace(/^"|"$/g,""))
+      : line.split(",").map(s=>s.trim().replace(/^"|"$/g,""));
+
+    const headers = splitLine(lines[0]).map(s=>s.toLowerCase());
+
+    // ── FORMAT A: Topstep closed-trade export ──
+    // Headers: Id, ContractName, EnteredAt, ExitedAt, EntryPrice, ExitPrice, Fees, PnL, Size, Type, TradeDay, ...
+    const isClosedTradeFormat =
+      headers.includes("enteredat") ||
+      headers.includes("entryprice") && headers.includes("exitprice") && headers.includes("type");
+
+    if(isClosedTradeFormat){
+      // Map header names to indices
+      const idx = {};
+      headers.forEach((h,i)=>{ idx[h]=i; });
+
+      const trades = [];
+      for(let i=1; i<lines.length; i++){
+        const cols = splitLine(lines[i]);
+        if(cols.length < 5) continue;
+
+        const contractName = cols[idx["contractname"]] || cols[idx["contract"]] || "";
+        const enteredAt    = cols[idx["enteredat"]]    || cols[idx["entrytime"]] || "";
+        const entryPrice   = parseFloat(cols[idx["entryprice"]]) || 0;
+        const exitPrice    = parseFloat(cols[idx["exitprice"]])  || 0;
+        const pnlRaw       = cols[idx["pnl"]] || "";
+        const pnl          = parseFloat(pnlRaw) || 0;
+        const size         = parseInt(cols[idx["size"]] || cols[idx["quantity"]] || "1") || 1;
+        const direction    = (cols[idx["type"]] || "").trim();  // "Long" or "Short"
+        const fees         = parseFloat(cols[idx["fees"]] || "0") || 0;
+
+        // Skip header-like rows
+        if(!contractName || contractName.toLowerCase()==="contractname") continue;
+
+        // Parse instrument — strip expiry suffix (MESM6 → MES, MNQM6 → MNQ, NQM6 → NQ)
+        const instrMatch = contractName.match(/^(MNQ|NQ|MES|ES|M2K|MYM)/i);
+        const instrument = instrMatch ? instrMatch[1].toUpperCase() : contractName;
+
+        const { dateStr, hour, minute } = parseTopstepDate(enteredAt);
+        const session = detectSession(hour, minute);
+
+        // Net P&L = exchange P&L minus fees (Topstep PnL field is gross)
+        const netPnl = (pnl - fees).toFixed(2);
+
+        trades.push({
+          id:           genId(),
+          date:         dateStr,
+          session,
+          firm:         "Topstep",
+          accountType:  "",
+          accountId:    "",
+          instrument,
+          setupType:    "",
+          direction:    direction.charAt(0).toUpperCase() + direction.slice(1).toLowerCase(),
+          contracts:    String(size),
+          entryPrice:   entryPrice.toFixed(2),
+          exitPrice:    exitPrice.toFixed(2),
+          pnl:          netPnl,
+          followedRules:"",
+          emotion:      "",
+          psychScore:   "",
+          notes:        `Gross P&L: ${currency(pnl)} | Fees: $${fees.toFixed(2)} | Net: ${currency(parseFloat(netPnl))}`,
+          screenshotLink:"",
+          setupGroup:   ""
+        });
+      }
+
+      if(trades.length > 0){
+        // Check for dupes by Id if present
+        const existingIds = new Set();
+        setTrades(prev => {
+          prev.forEach(t => { if(t.sourceId) existingIds.add(t.sourceId); });
+          const newTrades = trades.filter(t => !existingIds.has(t.sourceId));
+          return [...newTrades, ...prev];
+        });
+        const totalPnl = trades.reduce((s,t)=>s+parseFloat(t.pnl),0);
+        const wins     = trades.filter(t=>parseFloat(t.pnl)>0).length;
+        const losses   = trades.filter(t=>parseFloat(t.pnl)<0).length;
+        setCsvStatus(`✓ Imported ${trades.length} trades (${wins}W / ${losses}L) | Net: ${currency(totalPnl)} | Go tag your setups!`);
+        setCsvText("");
+      } else {
+        setCsvStatus("Detected Topstep closed-trade format but no valid rows found. Check that data rows are present below the header.");
+      }
+      return;
+    }
+
+    // ── FORMAT B: Legacy order-fill format (old parser) ──
+    // Kept as fallback for older Topstep exports that export individual fills
     const fills=[];
     for(const line of lines){
-      let cols = line.split("\t").map(s=>s.trim().replace(/^"|"$/g,""));
-      if(cols.length<5) cols=line.split(",").map(s=>s.trim().replace(/^"|"$/g,""));
+      const cols = splitLine(line);
       if(cols.length<10) continue;
       const first=cols[0]?.toLowerCase()||"";
       if(first.includes("order")||first.includes("id")||first.includes("time")||first.includes("date")) continue;
       const status=cols[3]||"";
       if(!status.toLowerCase().includes("filled")) continue;
-      const accountId=cols[1]||"";
       const symbol=cols[2]||"";
       const qty=parseInt(cols[5])||0;
       const side=cols[6]||"";
       const fillTimeStr=cols[9]||cols[7]||"";
       const fillPrice=parseFloat(cols[13]||cols[12]||"0");
       let fillTime=0;
-      try{ const c=fillTimeStr.replace(/\s*[-+]\d{2}:\d{2}$/,""); fillTime=new Date(c).getTime(); }catch{}
-      let dateStr=today();
-      try{ const m=fillTimeStr.match(/(\d{2})\/(\d{2})\/(\d{4})/); if(m)dateStr=`${m[3]}-${m[1]}-${m[2]}`; }catch{}
-      const instrument=INSTRUMENTS.find(i=>symbol.toUpperCase().includes(i))||symbol;
+      try{ fillTime=new Date(fillTimeStr.replace(/\s*[-+]\d{2}:\d{2}$/,"")).getTime(); }catch{}
+      const { dateStr, hour:fillHour, minute:fillMinute } = parseTopstepDate(fillTimeStr);
+      const instrMatch = symbol.toUpperCase().match(/^(MNQ|NQ|MES|ES|M2K|MYM)/);
+      const instrument = instrMatch ? instrMatch[1] : symbol;
       const isBuy=side.toLowerCase().includes("bid")||side.toLowerCase().includes("buy");
-      let fillHour=-1,fillMinute=0;
-      try{ const m=fillTimeStr.match(/(\d{2})\/\d{2}\/\d{4}\s+(\d{1,2}):(\d{2})/); if(m){fillHour=parseInt(m[2]);fillMinute=parseInt(m[3]);} }catch{}
-      fills.push({accountId,symbol,instrument,qty,isBuy,fillTime,fillPrice,dateStr,fillHour,fillMinute});
+      fills.push({symbol,instrument,qty,isBuy,fillTime,fillPrice,dateStr,fillHour,fillMinute});
     }
+
+    if(fills.length===0){
+      setCsvStatus("⚠ Could not parse this file. Expected Topstep Trade History export (Tab or CSV). Make sure you're exporting from the Trades tab, not the Orders tab.");
+      return;
+    }
+
     fills.sort((a,b)=>a.fillTime-b.fillTime);
-
-    const detectSession=(h,m)=>{
-      if(h<0) return "";
-      const t=h*60+m;
-      if(t>=1020||t<120) return "Asian";
-      if(t>=120&&t<480) return "London";
-      if(t>=480&&t<510) return "NY Pre-Market";
-      if(t>=510&&t<571) return "NY Open (9:30-10:30)";
-      if(t>=571&&t<660) return "NY Morning (10:30-12:00)";
-      if(t>=660&&t<900) return "NY Afternoon (12:00-4:00)";
-      return "Overnight";
-    };
-
     let openLots=[],position=0,setupPnl=0,setupContracts=0;
     let setupEntries=[],setupCloses=[],setupNum=0;
     let setupStartDate="",setupStartHour=-1,setupStartMinute=0;
-    let setupInstrument="",setupAccountId="",setupDirection="";
+    let setupInstrument="",setupDirection="";
     const setups=[];
 
     const flushSetup=()=>{
       if(setupContracts===0&&setupPnl===0) return;
       setupNum++;
-      const avgEntry=setupEntries.length>0?setupEntries.reduce((s,e)=>s+e.price*e.qty,0)/setupEntries.reduce((s,e)=>s+e.qty,0):0;
-      const avgExit=setupCloses.length>0?setupCloses.reduce((s,e)=>s+e.price*e.qty,0)/setupCloses.reduce((s,e)=>s+e.qty,0):0;
+      const avgEntry=setupEntries.reduce((s,e)=>s+e.price*e.qty,0)/setupEntries.reduce((s,e)=>s+e.qty,0);
+      const avgExit =setupCloses.reduce((s,e)=>s+e.price*e.qty,0) /setupCloses.reduce((s,e)=>s+e.qty,0);
       setups.push({
         id:genId(), date:setupStartDate,
         session:detectSession(setupStartHour,setupStartMinute),
-        firm:"Topstep", accountType:"", accountId:setupAccountId,
+        firm:"Topstep", accountType:"", accountId:"",
         instrument:setupInstrument, setupType:"", direction:setupDirection,
         contracts:String(setupContracts),
         entryPrice:avgEntry.toFixed(2), exitPrice:avgExit.toFixed(2),
@@ -522,21 +633,18 @@ function FuturesJournal() {
       });
       setupPnl=0;setupContracts=0;setupEntries=[];setupCloses=[];
       setupStartDate="";setupStartHour=-1;setupStartMinute=0;
-      setupInstrument="";setupAccountId="";setupDirection="";
+      setupInstrument="";setupDirection="";
     };
 
     for(const fill of fills){
       const signedQty=fill.isBuy?fill.qty:-fill.qty;
-      const prevPosition=position;
-      const newPosition=position+signedQty;
+      const prevPosition=position, newPosition=position+signedQty;
       const pv=POINT_VALUES[fill.instrument]||2;
       const isIncreasing=(prevPosition>=0&&signedQty>0)||(prevPosition<=0&&signedQty<0);
-
       if(prevPosition===0){
         if(setupContracts>0) flushSetup();
-        setupStartDate=fill.dateStr;setupStartHour=fill.fillHour;setupStartMinute=fill.fillMinute;
-        setupInstrument=fill.instrument;setupAccountId=fill.accountId;
-        setupDirection=fill.isBuy?"Long":"Short";
+        setupStartDate=fill.dateStr; setupStartHour=fill.fillHour; setupStartMinute=fill.fillMinute;
+        setupInstrument=fill.instrument; setupDirection=fill.isBuy?"Long":"Short";
         openLots.push({qty:fill.qty,price:fill.fillPrice});
         setupEntries.push({qty:fill.qty,price:fill.fillPrice});
         setupContracts+=fill.qty;
@@ -545,25 +653,21 @@ function FuturesJournal() {
         setupEntries.push({qty:fill.qty,price:fill.fillPrice});
         setupContracts+=fill.qty;
       } else {
-        let remainingQty=fill.qty;
+        let rem=fill.qty;
         setupCloses.push({qty:fill.qty,price:fill.fillPrice});
-        while(remainingQty>0&&openLots.length>0){
-          const lot=openLots[0];
-          const matchQty=Math.min(lot.qty,remainingQty);
-          if(position>0) setupPnl+=(fill.fillPrice-lot.price)*pv*matchQty;
-          else setupPnl+=(lot.price-fill.fillPrice)*pv*matchQty;
-          lot.qty-=matchQty; remainingQty-=matchQty;
-          if(lot.qty===0) openLots.shift();
+        while(rem>0&&openLots.length>0){
+          const lot=openLots[0], mq=Math.min(lot.qty,rem);
+          setupPnl+=position>0?(fill.fillPrice-lot.price)*pv*mq:(lot.price-fill.fillPrice)*pv*mq;
+          lot.qty-=mq; rem-=mq; if(lot.qty===0) openLots.shift();
         }
         if(Math.sign(newPosition)!==0&&Math.sign(newPosition)!==Math.sign(prevPosition)){
           flushSetup();
-          const flipQty=Math.abs(newPosition);
-          setupStartDate=fill.dateStr;setupStartHour=fill.fillHour;setupStartMinute=fill.fillMinute;
-          setupInstrument=fill.instrument;setupAccountId=fill.accountId;
-          setupDirection=newPosition>0?"Long":"Short";
-          openLots=[{qty:flipQty,price:fill.fillPrice}];
-          setupEntries=[{qty:flipQty,price:fill.fillPrice}];
-          setupContracts=flipQty;
+          const fq=Math.abs(newPosition);
+          setupStartDate=fill.dateStr; setupStartHour=fill.fillHour; setupStartMinute=fill.fillMinute;
+          setupInstrument=fill.instrument; setupDirection=newPosition>0?"Long":"Short";
+          openLots=[{qty:fq,price:fill.fillPrice}];
+          setupEntries=[{qty:fq,price:fill.fillPrice}];
+          setupContracts=fq;
         }
       }
       position=newPosition;
@@ -576,10 +680,10 @@ function FuturesJournal() {
       const totalPnl=setups.reduce((s,t)=>s+parseFloat(t.pnl),0);
       const wins=setups.filter(t=>parseFloat(t.pnl)>0).length;
       const losses=setups.filter(t=>parseFloat(t.pnl)<0).length;
-      setCsvStatus(`✓ Imported ${setups.length} setups (${wins}W/${losses}L) | Net: ${currency(totalPnl)}`);
+      setCsvStatus(`✓ Imported ${setups.length} trades (${wins}W/${losses}L) | Net: ${currency(totalPnl)}`);
       setCsvText("");
     } else {
-      setCsvStatus("No filled trades found. Check format: Tab or Comma-delimited, with 'Filled' status column.");
+      setCsvStatus("⚠ No trades parsed. Try the other export format from Topstep.");
     }
   };
 
@@ -1062,11 +1166,11 @@ function FuturesJournal() {
             <div style={{background:"#111c28",borderRadius:12,border:"1px solid #2a3a4e",padding:20,marginBottom:20}}>
               <div style={{fontSize:14,fontWeight:700,color:"#1b998b",marginBottom:12,letterSpacing:1}}>TOPSTEP CSV IMPORT</div>
               <div style={{fontSize:12,color:"#8a9bb5",marginBottom:16,lineHeight:1.9}}>
-                1. TopstepX → Trades tab → Export → Select date range → Export<br/>
-                2. Upload file below OR paste CSV/tab-delimited text<br/>
-                3. Only "Filled" orders imported — cancelled/rejected skipped<br/>
-                4. Pyramids &amp; partial closes handled via FIFO matching<br/>
-                5. After import, add tags in Trade Log (setup type, emotion, etc.)
+                1. TopstepX → <span style={{color:"#1b998b"}}>Account</span> → <span style={{color:"#1b998b"}}>Trade History</span> → set date range → <span style={{color:"#1b998b"}}>Export</span><br/>
+                2. Upload the .csv file below OR paste the raw text<br/>
+                3. Each row = one closed trade — entry, exit, P&L, size all included<br/>
+                4. Net P&L = Gross P&L minus fees (both shown in notes)<br/>
+                5. After import, use <span style={{color:"#1b998b"}}>Batch Edit</span> in Trade Log to tag setup types &amp; emotions fast
               </div>
 
               <label style={{
